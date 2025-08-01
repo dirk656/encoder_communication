@@ -85,35 +85,55 @@ private:
     }
 
     void process_response(const struct can_frame &frame) {
-        if (frame.can_dlc >= 7 && frame.data[1] == this->get_parameter("encoder_id").as_int()) {
-            // 解析32位编码器值(小端序)
-            uint32_t raw_value = (frame.data[6] << 24) | 
-                               (frame.data[5] << 16) | 
-                               (frame.data[4] << 8) | 
-                               frame.data[3];
-            
-            // 计算角度和圈数
-            int resolution = this->get_parameter("resolution").as_int();
-            float angle = (raw_value % resolution) * 360.0f / resolution;
-            float turns = static_cast<float>(raw_value) / resolution;
-            
-            // 发布消息
-            auto angle_msg = std_msgs::msg::Float32();
-            angle_msg.data = angle;
-            pub_angle_->publish(angle_msg);
-            
-            auto turns_msg = std_msgs::msg::Float32();
-            turns_msg.data = turns;
-            pub_turns_->publish(turns_msg);
-            
-            auto raw_msg = std_msgs::msg::Float32();
-            raw_msg.data = static_cast<float>(raw_value);
-            pub_raw_->publish(raw_msg);
-            
-            // 发布接收到的CAN帧(可选)
-            publish_can_frame(frame, false);
-        }
+    // === 1. 协议格式验证 ===
+    if (frame.can_dlc < 4) {  // 最小长度=4 (LEN+ID+FUNC+至少1字节数据)
+        RCLCPP_WARN(get_logger(), "无效帧长度: %d", frame.can_dlc);
+        return;
     }
+
+    const uint8_t len = frame.data[0];
+    const uint8_t id = frame.data[1];
+    const uint8_t func = frame.data[2];
+
+    // 验证长度字段一致性
+    if (len != frame.can_dlc) {
+        RCLCPP_WARN(get_logger(), "长度字段不匹配: 头=%d 实际=%d", len, frame.can_dlc);
+        return;
+    }
+
+    // === 2. 功能码处理 ===
+    switch (func) {
+        case 0x01: {  // 读取编码器值
+            if (frame.can_dlc != 7) {  // 4字节数据+3字节头
+                RCLCPP_WARN(get_logger(), "读取响应长度错误: 预期7字节，收到%d字节", frame.can_dlc);
+                return;
+            }
+
+            // 小端序解析32位数据 (手册第13页示例)
+            uint32_t raw_value = (static_cast<uint32_t>(frame.data[6]) << 24 |
+                                (static_cast<uint32_t>(frame.data[5]) << 16 |
+                                (static_cast<uint32_t>(frame.data[4]) << 8 |
+                                static_cast<uint32_t>(frame.data[3]);
+
+            // 计算角度（手册第3页分辨率说明）
+            float angle = (raw_value % resolution_) * 360.0f / resolution_;
+            RCLCPP_DEBUG(get_logger(), "原始值: %u 角度: %.2f°", raw_value, angle);
+
+            // 发布数据
+            auto msg = std_msgs::msg::Float32();
+            msg.data = angle;
+            pub_angle_->publish(msg);
+            break;
+        }
+
+        case 0x00:  // 错误响应
+            RCLCPP_ERROR(get_logger(), "编码器返回错误码: 0x%02X", frame.data[3]);
+            break;
+
+        default:
+            RCLCPP_WARN(get_logger(), "未知功能码: 0x%02X", func);
+    }
+}
 
     void publish_can_frame(const struct can_frame &frame, bool is_tx) {
         auto msg = can_msgs::msg::Frame();
